@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cyber Pong — Defender Edition</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at top, #10251f 0%, #060b0a 55%, #020403 100%);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d7ffea;
+    }
+    .wrap { width: min(96vw, 1000px); padding: 18px; }
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(1.2rem, 3vw, 2rem);
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      color: #7dffc4;
+      text-shadow: 0 0 18px rgba(125, 255, 196, .45);
+    }
+    canvas {
+      width: 100%;
+      aspect-ratio: 16 / 10;
+      display: block;
+      background: #04100d;
+      border: 1px solid #1f5f4a;
+      border-radius: 14px;
+      box-shadow: 0 0 0 1px #092018, 0 24px 80px rgba(0, 0, 0, .65), inset 0 0 60px rgba(0, 255, 170, .06);
+    }
+    .hint {
+      margin-top: 10px;
+      font-size: .78rem;
+      color: #8fbfa9;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    kbd {
+      background: #0d2a22;
+      border: 1px solid #2b7a5c;
+      border-bottom-width: 3px;
+      border-radius: 6px;
+      padding: 1px 6px;
+      color: #baffdf;
+    }
+    button {
+      font: inherit;
+      cursor: pointer;
+      background: #0d2a22;
+      color: #baffdf;
+      border: 1px solid #2b7a5c;
+      border-radius: 8px;
+      padding: 5px 10px;
+    }
+    button:hover:not(:disabled) { background: #123a2d; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    #status { color: #7dffc4; min-width: 16ch; text-align: right; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Cyber Pong</h1>
+    <canvas id="game" width="960" height="600" aria-label="1-player Pong game"></canvas>
+    <div class="hint">
+      <span><kbd>W</kbd>/<kbd>S</kbd> or <kbd>↑</kbd>/<kbd>↓</kbd> move paddle</span>
+      <span><kbd>P</kbd> pause &nbsp; <kbd>R</kbd> reset &nbsp; <kbd>F</kbd> speed &nbsp; <kbd>G</kbd> skip</span>
+      <span id="status">RAF · 0 FPS · skip 1x</span>
+      <button id="speedToggle" type="button">Unlimited FPS</button>
+      <button id="skipToggle" type="button">Skip: 1x</button>
+    </div>
+  </main>
+
+  <script>
+    "use strict";
+
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const speedToggleBtn = document.getElementById("speedToggle");
+    const skipToggleBtn = document.getElementById("skipToggle");
+
+    const W = canvas.width;
+    const H = canvas.height;
+    const WIN_SCORE = 3;
+    const STORAGE_KEY = "humanFailed";
+
+    const config = {
+      playerSpeed: 520,
+      baseBallSpeed: 420,
+      maxBallSpeed: 780,
+      ballRadius: 8,
+      paddleWidth: 16,
+      paddleHeight: 108,
+      maxBounceAngle: Math.PI / 3,
+      aiIdleSpeed: 360
+    };
+
+    const SKIP_LEVELS = [1, 2, 4, 8, 16, 32];
+
+    const state = {
+      scorePlayer: 0,
+      scoreAI: 0,
+      paused: false,
+      gameOver: false,
+      time: 0,
+      shake: 0,
+      aiTargetY: H / 2,
+      aiSpeed: 600,
+      unlimited: false,
+      skip: 1,
+      fps: 0
+    };
+
+    const keys = new Set();
+
+    const player = {
+      x: 26,
+      y: H / 2 - config.paddleHeight / 2,
+      w: config.paddleWidth,
+      h: config.paddleHeight
+    };
+
+    const ai = {
+      x: W - 26 - config.paddleWidth,
+      y: H / 2 - config.paddleHeight / 2,
+      w: config.paddleWidth,
+      h: config.paddleHeight
+    };
+
+    const ball = {
+      x: W / 2,
+      y: H / 2,
+      vx: config.baseBallSpeed,
+      vy: 0,
+      r: config.ballRadius
+    };
+
+    // --- Persistence (educational demo, not secure) --------------------------
+
+    function loadHumanFailed() {
+      try {
+        return localStorage.getItem(STORAGE_KEY) === "true";
+      } catch (e) {
+        return false; // storage unavailable — fail open, game runs
+      }
+    }
+
+    function saveHumanFailed() {
+      try {
+        localStorage.setItem(STORAGE_KEY, "true");
+      } catch (e) {
+        // storage unavailable — game still ends normally this session
+      }
+    }
+
+    function disableControls() {
+      keys.clear();
+      speedToggleBtn.disabled = true;
+      skipToggleBtn.disabled = true;
+    }
+
+    // --- Helpers --------------------------------------------------------------
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function speedOf(vx, vy) {
+      return Math.hypot(vx, vy);
+    }
+
+    function setBallSpeed(targetSpeed, angle) {
+      const s = Math.min(targetSpeed, config.maxBallSpeed);
+      ball.vx = Math.cos(angle) * s;
+      ball.vy = Math.sin(angle) * s;
+    }
+
+    function resetBall(direction = Math.random() < 0.5 ? -1 : 1) {
+      ball.x = W / 2;
+      ball.y = H / 2;
+      const angle = (Math.random() * 0.9 - 0.45) * direction;
+      ball.vx = Math.cos(angle) * config.baseBallSpeed * direction;
+      ball.vy = Math.sin(angle) * config.baseBallSpeed;
+
+      if (ball.vx > 0) updateAIPrediction();
+      else resetAIPrediction();
+    }
+
+    function resetGame() {
+      state.scorePlayer = 0;
+      state.scoreAI = 0;
+      state.gameOver = false;
+      state.time = 0;
+      player.y = H / 2 - player.h / 2;
+      ai.y = H / 2 - ai.h / 2;
+      resetBall(Math.random() < 0.5 ? -1 : 1);
+    }
+
+    // --- AI prediction ---------------------------------------------------------
+
+    function predictBallYAtX(targetX) {
+      if (ball.vx <= 0) return ball.y;
+
+      const top = ball.r;
+      const bottom = H - ball.r;
+      const timeToReach = (targetX - ball.x) / ball.vx;
+      if (timeToReach <= 0) return ball.y;
+
+      let y = ball.y;
+      let vy = ball.vy;
+      let remaining = timeToReach;
+      let guard = 0;
+
+      while (remaining > 0 && guard++ < 1000) {
+        if (Math.abs(vy) < 1e-6) return y;
+
+        const timeToBoundary = vy > 0
+          ? (bottom - y) / vy
+          : (top - y) / vy;
+
+        if (timeToBoundary >= remaining) {
+          y += vy * remaining;
+          remaining = 0;
+        } else {
+          y += vy * timeToBoundary;
+          vy = -vy;
+          remaining -= timeToBoundary;
+        }
+      }
+
+      return clamp(y, top, bottom);
+    }
+
+    function updateAIPrediction() {
+      const interceptX = ai.x;
+      const predictedY = predictBallYAtX(interceptX);
+      const timeToReach = Math.max((interceptX - ball.x) / ball.vx, 0.05);
+      const distance = Math.abs(predictedY - (ai.y + ai.h / 2));
+
+      state.aiTargetY = predictedY;
+      state.aiSpeed = clamp(distance / timeToReach * 1.35, 620, 1800);
+    }
+
+    function resetAIPrediction() {
+      state.aiTargetY = H / 2;
+      state.aiSpeed = config.aiIdleSpeed;
+    }
+
+    // --- Paddle bounce ----------------------------------------------------------
+
+    function bounceOffPaddle(paddle, isPlayer) {
+      const paddleCenter = paddle.y + paddle.h / 2;
+      const offset = clamp((ball.y - paddleCenter) / (paddle.h / 2), -1, 1);
+      const angle = offset * config.maxBounceAngle;
+      const newSpeed = speedOf(ball.vx, ball.vy) * 1.035;
+
+      if (isPlayer) {
+        ball.x = paddle.x + paddle.w + ball.r;
+        setBallSpeed(newSpeed, angle);
+        ball.vx = Math.abs(ball.vx);
+        updateAIPrediction();
+      } else {
+        ball.x = paddle.x - ball.r;
+        setBallSpeed(newSpeed, Math.PI - angle);
+        ball.vx = -Math.abs(ball.vx);
+        resetAIPrediction();
+      }
+
+      state.shake = 0.12;
+    }
+
+    function update(dt) {
+      if (state.paused || state.gameOver) return;
+
+      state.time += dt;
+      state.shake = Math.max(0, state.shake - dt);
+
+      // Player movement
+      let playerMove = 0;
+      if (keys.has("ArrowUp") || keys.has("w")) playerMove -= 1;
+      if (keys.has("ArrowDown") || keys.has("s")) playerMove += 1;
+      player.y = clamp(player.y + playerMove * config.playerSpeed * dt, 0, H - player.h);
+
+      // AI movement toward the predicted intercept point
+      const aiCenter = ai.y + ai.h / 2;
+      const diff = state.aiTargetY - aiCenter;
+      const maxStep = state.aiSpeed * dt;
+      ai.y = clamp(ai.y + clamp(diff, -maxStep, maxStep), 0, H - ai.h);
+
+      // Ball movement
+      ball.x += ball.vx * dt;
+      ball.y += ball.vy * dt;
+
+      // Top/bottom boundaries
+      if (ball.y - ball.r <= 0) {
+        ball.y = ball.r;
+        ball.vy = Math.abs(ball.vy);
+      } else if (ball.y + ball.r >= H) {
+        ball.y = H - ball.r;
+        ball.vy = -Math.abs(ball.vy);
+      }
+
+      // Player paddle collision
+      if (
+        ball.vx < 0 &&
+        ball.x - ball.r <= player.x + player.w &&
+        ball.x - ball.r >= player.x - ball.r &&
+        ball.y + ball.r >= player.y &&
+        ball.y - ball.r <= player.y + player.h
+      ) {
+        bounceOffPaddle(player, true);
+      }
+
+      // AI paddle collision
+      if (
+        ball.vx > 0 &&
+        ball.x + ball.r >= ai.x &&
+        ball.x + ball.r <= ai.x + ai.w + ball.r &&
+        ball.y + ball.r >= ai.y &&
+        ball.y - ball.r <= ai.y + ai.h
+      ) {
+        bounceOffPaddle(ai, false);
+      }
+
+      // Scoring — capped at 3
+      if (ball.x + ball.r < 0) {
+        state.scoreAI = Math.min(state.scoreAI + 1, WIN_SCORE);
+
+        if (state.scoreAI >= WIN_SCORE) {
+          // Game over: freeze the frame at the moment the ball hit the back wall
+          state.gameOver = true;
+          ball.x = ball.r; // ball rests at the left wall
+          ball.vx = 0;
+          saveHumanFailed();
+          disableControls();
+          return;
+        }
+
+        resetBall(1); // serve toward player
+      } else if (ball.x - ball.r > W) {
+        // Human win is intentionally unhandled — game keeps running
+        state.scorePlayer = Math.min(state.scorePlayer + 1, WIN_SCORE);
+        resetBall(-1); // serve toward AI
+      }
+    }
+
+    function draw() {
+      ctx.save();
+
+      if (state.shake > 0) {
+        const mag = state.shake * 18;
+        ctx.translate((Math.random() - 0.5) * mag, (Math.random() - 0.5) * mag);
+      }
+
+      ctx.fillStyle = "#04100d";
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.fillStyle = "rgba(125, 255, 196, 0.025)";
+      for (let y = 0; y < H; y += 6) ctx.fillRect(0, y, W, 1);
+
+      ctx.strokeStyle = "rgba(125, 255, 196, 0.35)";
+      ctx.lineWidth = 4;
+      ctx.strokeRect(2, 2, W - 4, H - 4);
+
+      ctx.strokeStyle = "rgba(215, 255, 234, 0.22)";
+      ctx.lineWidth = 4;
+      ctx.setLineDash([18, 18]);
+      ctx.beginPath();
+      ctx.moveTo(W / 2, 0);
+      ctx.lineTo(W / 2, H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Entities are drawn only once the game has actually started
+      if (state.time > 0) {
+        ctx.fillStyle = "#d7ffea";
+        ctx.font = "bold 72px ui-monospace, Menlo, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(state.scorePlayer, W / 2 - 90, 72);
+        ctx.fillText(state.scoreAI, W / 2 + 90, 72);
+
+        drawPaddle(player.x, player.y, player.w, player.h, "#7dffc4");
+        drawPaddle(ai.x, ai.y, ai.w, ai.h, "#ff5d73");
+
+        ctx.shadowColor = "#baffdf";
+        ctx.shadowBlur = 18;
+        ctx.fillStyle = "#eafff5";
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+
+      if (state.paused) {
+        ctx.fillStyle = "rgba(2, 8, 6, 0.72)";
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "#7dffc4";
+        ctx.font = "bold 42px ui-monospace, Menlo, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("PAUSED", W / 2, H / 2);
+      }
+
+      if (state.gameOver) {
+        // Flashing end-of-game text — blinking uses wall-clock time so it
+        // animates even though the game is frozen
+        const flash = Math.floor(performance.now() / 400) % 2 === 0;
+
+        ctx.fillStyle = "rgba(2, 8, 6, 0.55)";
+        ctx.fillRect(0, 0, W, H);
+
+        if (flash) {
+          ctx.fillStyle = "#ff5d73";
+          ctx.shadowColor = "#ff5d73";
+          ctx.shadowBlur = 32;
+          ctx.font = "bold 72px ui-monospace, Menlo, Consolas, monospace";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText("HUMAN FAILED!", W / 2, H / 2);
+          ctx.shadowBlur = 0;
+        }
+      }
+
+      ctx.restore();
+    }
+
+    function drawPaddle(x, y, w, h, color) {
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = color;
+      roundRect(x, y, w, h, 8);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    function roundRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    // --- FPS / speed / frame-skip controls ------------------------------------
+
+    let drawnFrames = 0;
+    let fpsLast = performance.now();
+
+    function updateStatus() {
+      if (state.gameOver) {
+        statusEl.textContent = "GAME OVER";
+      } else {
+        const mode = state.unlimited ? "MAX" : "RAF";
+        statusEl.textContent = `${mode} · ${state.fps} FPS · skip ${state.skip}x`;
+      }
+      speedToggleBtn.textContent = state.unlimited ? "Limited FPS" : "Unlimited FPS";
+      skipToggleBtn.textContent = `Skip: ${state.skip}x`;
+    }
+
+    function toggleSpeed() {
+      state.unlimited = !state.unlimited;
+      lastTime = performance.now();
+      updateStatus();
+    }
+
+    function cycleSkip(direction = 1) {
+      const index = SKIP_LEVELS.indexOf(state.skip);
+      const next = (index + direction + SKIP_LEVELS.length) % SKIP_LEVELS.length;
+      state.skip = SKIP_LEVELS[next];
+      drawnFrames = 0;
+      fpsLast = performance.now();
+      updateStatus();
+    }
+
+    speedToggleBtn.addEventListener("click", (event) => {
+      toggleSpeed();
+      event.currentTarget.blur();
+    });
+
+    skipToggleBtn.addEventListener("click", (event) => {
+      cycleSkip(1);
+      event.currentTarget.blur();
+    });
+
+    let lastTime = performance.now();
+
+    function loop(now) {
+      now = now ?? performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      // Calculate N frames of movement with no sleep/wait, then draw only the last
+      const n = state.skip;
+      const subDt = dt / n;
+      for (let i = 0; i < n; i++) {
+        update(subDt);
+      }
+
+      draw();
+
+      drawnFrames++;
+      const elapsed = now - fpsLast;
+      if (elapsed >= 500) {
+        state.fps = Math.round(drawnFrames * 1000 / elapsed);
+        drawnFrames = 0;
+        fpsLast = now;
+      }
+
+      updateStatus();
+
+      if (state.unlimited) {
+        setTimeout(() => loop(), 0);
+      } else {
+        requestAnimationFrame(loop);
+      }
+    }
+
+    window.addEventListener("keydown", (event) => {
+      if (state.gameOver) {
+        keys.clear();
+        return;
+      }
+
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+      keys.add(key);
+
+      if (["ArrowUp", "ArrowDown", " "].includes(event.key)) event.preventDefault();
+      if (key === "p") state.paused = !state.paused;
+      if (key === "r") resetGame();
+      if (key === "f") toggleSpeed();
+      if (key === "g") cycleSkip(event.shiftKey ? -1 : 1);
+    });
+
+    window.addEventListener("keyup", (event) => {
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+      keys.delete(key);
+    });
+
+    window.addEventListener("blur", () => keys.clear());
+
+    // --- Boot -----------------------------------------------------------------
+
+    if (loadHumanFailed()) {
+      // Previous loss found — enter flashing end mode without starting the game
+      state.gameOver = true;
+      disableControls();
+    } else {
+      resetGame();
+    }
+
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
